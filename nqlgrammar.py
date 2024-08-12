@@ -1,4 +1,6 @@
 import pyparsing as pp
+pp.ParserElement.enable_packrat()
+
 import nqlast as nql
 
 def _grammar():
@@ -161,7 +163,6 @@ def _grammar():
 
     program = pp.ZeroOrMore(decl).setParseAction(a(lambda l,t: nql.Program(lineno=l, children=list(t))))
     program.ignore(pp.cStyleComment)
-    program.enablePackrat()
     return program
 
 grammar = _grammar()
