@@ -34,12 +34,15 @@ class State:
 
     def be(self, name, move=None, next=None, write=None,
            move0=None, next0=None, write0=None,
-           move1=None, next1=None, write1=None):
+           move1=None, next1=None, write1=None,
+           old_tape=None):
         """Defines a Turing machine state.
 
         The movement direction, next state, and new tape value can be defined
         depending on the old tape value, or for both tape values at the same time.
-        Next state and direction must be provided, tape value can be omitted for no change."""
+        Next state and direction must be provided, tape value can be omitted for no change.
+        The set of possible tape values this state can encounter can also be recorded
+        allowing for future optimization."""
         assert not self.set
         self.set = True
         self.name = name
@@ -49,10 +52,12 @@ class State:
         self.next1 = next1 or next
         self.write0 = write0 or write or '0'
         self.write1 = write1 or write or '1'
+        self.old_tape = old_tape or set(('0', '1'))
         assert self.move0 in (-1, 1)
         assert self.move1 in (-1, 1)
         assert self.write0 in ('0', '1')
         assert self.write1 in ('0', '1')
+        assert all(bit in ('0', '1') for bit in self.old_tape)
         assert isinstance(self.name, str)
         assert isinstance(self.next0, State) or isinstance(self.next0, Halt)
         assert isinstance(self.next1, State) or isinstance(self.next1, Halt)
@@ -62,7 +67,7 @@ class State:
         assert isinstance(other, State) and other.set
         self.be(name=other.name, move0=other.move0, next0=other.next0,
                 write0=other.write0, move1=other.move1, next1=other.next1,
-                write1=other.write1)
+                write1=other.write1, old_tape=other.old_tape.copy())
 
 def make_bits(num, bits):
     """Constructs a bit string of length=bits for an integer num."""
@@ -133,10 +138,13 @@ def cfg_optimizer(parts):
 
     # Thread jumps to jumps
     # Delete jumps to the next instruction
+    # Jumps to the Halt instruction should just Halt instead.
+
     counter = 0
     label_map = {}
     rlabel_map = {}
     goto_map = {}
+    halt_set = set()
     labels = []
     for insn in parts:
         if isinstance(insn, Label):
@@ -148,6 +156,8 @@ def cfg_optimizer(parts):
             labels = []
             if isinstance(insn, Goto):
                 goto_map[counter] = insn.name
+            if isinstance(insn, Subroutine) and insn.name == 'halt':
+                halt_set.add(counter)
             counter += 1
     for label in labels:
         label_map[label] = counter
@@ -173,38 +183,50 @@ def cfg_optimizer(parts):
             # print("CFGO", insn.name, counter, goes_to, next_goes_to)
             if goes_to == counter + 1 or goes_to == next_goes_to:
                 parts[index] = None
-            elif direct_goes_to != goes_to:
-                parts[index] = Goto(rlabel_map[goes_to])
+            else:
+                if goes_to in halt_set:
+                    parts[index] = Subroutine(Halt(), 0, 'halt')
+                    pass
+                elif direct_goes_to != goes_to:
+                    parts[index] = Goto(rlabel_map[goes_to])
         counter += 1
 
     # print(repr(parts))
 
     # Delete dead code
 
-    # label_to_index = {}
-    # for index, insn in enumerate(parts):
-    #     if isinstance(insn, Label):
-    #         label_to_index[insn.name] = index
+    label_to_index = {}
+    for index, insn in enumerate(parts):
+        if isinstance(insn, Label):
+            label_to_index[insn.name] = index
 
-    # grey_index = [0]
-    # black_index = set()
-    # while grey_index:
-    #     ix = grey_index.pop()
-    #     if ix in black_index or ix >= len(parts):
-    #         continue
-    #     black_index.add(ix)
+    grey_index = [0]
+    black_index = set()
+    while grey_index:
+        ix = grey_index.pop()
+        if ix in black_index or ix >= len(parts):
+            continue
+        black_index.add(ix)
 
-    #     if isinstance(insn, Goto):
-    #         grey_index.append(label_to_index[insn.name])
-    #     else:
-    #         grey_index.append(ix + 1)
-    #         if insn and insn.is_decrement:
-    #             grey_index.append(ix + 2)
+        if isinstance(parts[ix], Goto):
+            grey_index.append(label_to_index[parts[ix].name])
+        else:
+            grey_index.append(ix + 1)
+            if parts[ix] and parts[ix].is_decrement:
+                # mark one past the first real instruction
+                ix = ix + 1
+                while ix < len(parts) and not \
+                    (isinstance(parts[ix], Subroutine) or
+                     isinstance(parts[ix], Goto)):
+                    ix = ix + 1
+                    grey_index.append(ix)
+                grey_index.append(ix + 1)
 
-    # for index in range(len(parts)):
-    #     if index not in black_index:
-    #         print("DEAD CODE")
-    #         parts[index] = None
+    for index in range(len(parts)):
+        if index not in black_index and \
+            (isinstance(parts[ix], Subroutine) or
+             isinstance(parts[ix], Goto)):
+             parts[index] = None
 
     return tuple(p for p in parts if p)
 
@@ -221,7 +243,7 @@ class MachineBuilder:
     # Quick=5: subroutines can cheat to the extent of storing non-integers
 
     def __init__(self, control_args):
-        self._nextreg = 0
+        self.nextreg = 0
         self._memos = {}
         self.control_args = control_args
 
@@ -253,25 +275,12 @@ class MachineBuilder:
         return entry
 
     @memo
-    def reg_init(self):
-        """Primitive subroutine which initializes a register.  Call this N
-        times before using registers less than N."""
-        return Subroutine(self.register_common().init, 0, 'reg_init')
-
-    @memo
     def register_common(self):
         """Primitive register operations start with the tape head on the first
         1 bit of a register, and exit by running back into the dispatcher."""
         (inc_shift_1, inc_shift_0, dec_init, dec_check, dec_scan_1,
          dec_scan_0, dec_scan_done, dec_shift_0, dec_shift_1, dec_restore,
-         return_0, return2_0, return_1, return2_1, init_f1, init_f2,
-         init_scan_1, init_scan_0) = (State() for i in range(18))
-
-        # Initialize routine
-        init_f1.be(move=1, next=init_f2, name='init.f1')
-        init_f2.be(move=1, next=init_scan_0, name='init.f2')
-        init_scan_1.be(move=1, next1=init_scan_1, next0=init_scan_0, name='init.scan_1') # only 0 is possible
-        init_scan_0.be(write0='1', move0=-1, next0=return_1, move1=1, next1=init_scan_1, name='init.scan_0')
+         return_0, return2_0, return_1, return2_1) = (State() for i in range(14))
 
         # Increment the register, the first 1 bit of which is under the tape head
         inc_shift_1.be(move=1, write='1', next0=inc_shift_0, next1=inc_shift_1, name='inc.shift_1')
@@ -297,7 +306,7 @@ class MachineBuilder:
         return_1.be(move=-1, next0=return_0, next1=return_1, name='return.1')
         return2_1.be(move=-1, next0=return2_0, next1=return2_1, name='return2.1')
 
-        return namedtuple('register_common', 'inc dec init')(inc_shift_1, dec_init, init_f1)
+        return namedtuple('register_common', 'inc dec')(inc_shift_1, dec_init)
 
     # Implementing the subroutine model
 
@@ -347,7 +356,7 @@ class MachineBuilder:
         return Subroutine(Halt(), 0, 'halt')
 
     @memo
-    def jump(self, order, rel_pc, sub_name):
+    def jump(self, order, rel_pc, from_pc, sub_name):
         """A subprogram which replaces a suffix of the PC, for relative jumps.
 
         Used automatically by the Goto operator."""
@@ -355,13 +364,15 @@ class MachineBuilder:
         steps = [State() for i in range(order + 2)]
         steps[order+1] = self.dispatch_order(order, rel_pc >> order)
         steps[0].be(move=-1, next=steps[1], \
-            name='{}.jump({},{},{})'.format(sub_name, rel_pc, order, 0))
+            name='{}.jump({},{},{},{})'.format(sub_name, rel_pc, from_pc, order, 0))
         for i in range(order):
             bit = str((rel_pc >> i) & 1)
+            from_bit = str((from_pc >> i) & 1)
             steps[i+1].be(move=-1, next=steps[i+2], write=bit, \
-                name='{}.jump({},{},{})'.format(sub_name, rel_pc, order, i+1))
+                old_tape=set((from_bit)), \
+                name='{}.jump({},{},{},{})'.format(sub_name, rel_pc, from_pc, order, i+1))
 
-        return Subroutine(steps[0], 0, '{}.jump({},{})'.format(sub_name, rel_pc, order))
+        return Subroutine(steps[0], 0, '{}.jump({},{},{})'.format(sub_name, rel_pc, from_pc, order))
 
     @memo
     def rjump(self, rel_pc):
@@ -393,14 +404,14 @@ class MachineBuilder:
         offset = 0
 
         if not self.control_args.no_cfg_optimize:
+            # run the optimizer twice as the dead code elimination can open up
+            # more goto optimization opertunities.
+            parts = cfg_optimizer(parts)
             parts = cfg_optimizer(parts)
 
         if name == 'main()':
-            # inject code to initialize registers (a bit of a hack)
-            regcount = self._nextreg
-            while regcount & (regcount - 1):
-                regcount += 1
-            parts = regcount * (self.reg_init(), ) + parts
+            # execution starts at PC 1. Inject noop
+            parts = (self.noop(0), ) + parts
 
         for part in parts:
             if isinstance(part, Label):
@@ -463,12 +474,8 @@ class MachineBuilder:
                         base = (offset >> jump_order) << jump_order
                         rel = target - base
                         if (jump_order, rel) in jumps_required:
-                            part = self.jump(jump_order, rel, name)
+                            part = self.jump(jump_order, rel, offset, name)
                             # don't break, we want to take the largest reqd jump
-                            # except for very short jumps, those have low enough
-                            # entropy to be worthwhile
-                            if jump_order < 3:
-                                break
                     assert part
             offset_bits = make_bits(offset >> part.order, order - part.order)
             goto_line = goto_map.get(offset)
@@ -482,8 +489,8 @@ class MachineBuilder:
     @memo
     def register(self, name):
         """Assigns a name to a register, and creates the primitive inc/dec routines."""
-        index = self._nextreg
-        self._nextreg += 1
+        index = self.nextreg
+        self.nextreg += 1
         pad = 0
 
         inc = Subroutine(self.reg_incr(index), 0, 'reg_incr('+name+')')
@@ -525,7 +532,54 @@ class Machine:
             assert False
 
         self.builder.dispatchroot().clone(self.main.entry)
-        self.entry = self.builder.dispatch_order(self.builder.pc_bits, 0)
+        if self.builder.nextreg < 21:
+            # The following 5 state TM will initialize 19 empty registers (+ junk at the end)
+            # then transition inc to create the 20th register
+
+            state0 = State()
+            state1 = State()
+            state2 = State()
+            state3 = State()
+            state4 = State()
+
+            state0.be(write0='1', move0=-1, next0=state1, write1='1', move1=-1, next1=state0, name='0')
+            state1.be(write0='1', move0=-1, next0=state2, write1='1', move1=-1, next1=state4, name='1')
+            state2.be(write0='1', move0=+1, next0=state3, write1='0', move1=+1, next1=state0, name='2')
+            state3.be(write0='1', move0=+1, next0=state0, write1='1', move1=+1, next1=state3, name='3')
+            state4.be(write0='0', move0=-1, next0=self.builder.register_common().inc, write1='0', move1=-1, next1=state1, name='4')
+
+            self.entry = state0
+        elif self.builder.nextreg < 121:
+            # The following 6 state TM will initialize 119 empty registers,
+            # then transition to inc to create the 120th register
+
+            state0 = State()
+            state1 = State()
+            state2 = State()
+            state3 = State()
+            state4 = State()
+            state5 = State()
+
+            state0.be(write0='1', move0=-1, next0=state4, write1='1', move1=-1, next1=state0, name='0')
+            state1.be(write0='1', move0=-1, next0=state5, write1='0', move1=+1, next1=state2, name='1')
+            state2.be(write0='1', move0=+1, next0=state4, write1='1', move1=+1, next1=state1, name='2')
+            state3.be(write0='1', move0=-1, next0=state0, write1='1', move1=+1, next1=state3, name='3')
+            state4.be(write0='1', move0=+1, next0=state1, write1='1', move1=+1, next1=state3, name='4')
+            state5.be(write0='0', move0=-1, next0=self.builder.register_common().inc, write1='0', move1=-1, next1=state1, name='5')
+
+            self.entry = state0
+        else:
+            # Let's just do it the simple way.
+            regend = self.builder.register_common().inc.next0
+
+            for i in reversed(range(self.builder.nextreg)):
+                reginit = State()
+                reginit.be(write = '1', move=-1, next=regend, name=str(i) + '.reg.init')
+                regend = State()
+                regend.be(write = '0', move=-1, next=reginit, name=str(i) + '.reg.end')
+
+            self.entry = reginit
+
 
         self.state = self.entry
         self.left_tape = []
@@ -537,7 +591,19 @@ class Machine:
         """Processes command line arguments and runs the test harness for a machine."""
 
         if not args.dont_compress:
-            self.compress()
+            while True:
+                # The different optimization passes will interact with each other.
+                # Continue optimizing so long as we're making forward progress.
+                # combine_states returns after the first opportunity it finds,
+                # but this is intended for small TMs so the quadratic complexity
+                # shouldn't matter.
+                if self.compress():
+                    continue
+                if self.skip_noop_transitions():
+                    continue
+                if self.combine_states():
+                    continue
+                break
 
         if args.print_subs:
             self.print_subs()
@@ -551,33 +617,128 @@ class Machine:
 
     def compress(self):
         """Combine pairs of equivalent states in the turing machine."""
-        while True:
-            did_work = False
-            unique_map = {}
-            replacement_map = {}
+        did_work = False
+        unique_map = {}
+        replacement_map = {}
 
-            for state in self.reachable():
-                tup = (state.next0, state.next1, state.write0, state.write1,
-                       state.move0, state.move1)
-                if tup in unique_map:
-                    replacement_map[state] = unique_map[tup]
-                else:
-                    unique_map[tup] = state
+        for state in self.reachable():
+            tup = (state.next0, state.next1, state.write0, state.write1,
+                   state.move0, state.move1)
+            if tup in unique_map:
+                unique_map[tup].old_tape = unique_map[tup].old_tape | state.old_tape
+                replacement_map[state] = unique_map[tup]
+            else:
+                unique_map[tup] = state
 
-            for state in self.reachable():
-                if state.next0 in replacement_map:
-                    did_work = True
-                    state.next0 = replacement_map[state.next0]
-                if state.next1 in replacement_map:
-                    did_work = True
-                    state.next1 = replacement_map[state.next1]
-
-            if self.entry in replacement_map:
+        for state in self.reachable():
+            if state.next0 in replacement_map:
                 did_work = True
-                self.entry = replacement_map[self.entry]
+                state.next0 = replacement_map[state.next0]
+            if state.next1 in replacement_map:
+                did_work = True
+                state.next1 = replacement_map[state.next1]
 
-            if not did_work:
-                break
+        if self.entry in replacement_map:
+            did_work = True
+            self.entry = replacement_map[self.entry]
+        return did_work
+
+    def combine_states(self):
+        """Finds a pair of states with opposite tape liveness and updates them
+        to match each other."""
+
+        # Prefer to merge states where a parent states will thereby become compressable.
+        state_map = {}
+
+        #But if not merge any old_tape '0' with any old_tape '1' state
+        all_map = {'0': [], '1': []}
+
+        for state in self.reachable():
+            if state.next0 is state.next1:
+                tup = (state.write0, state.write1, state.move0, state.move1)
+                if len(state.next0.old_tape) == 1:
+                    for bit in state.next0.old_tape:
+                        state_map.setdefault(tup, {'0': [], '1': []})[bit].append(state.next0)
+            if len(state.old_tape) == 1:
+                for bit in state.old_tape:
+                    all_map[bit].append(state)
+
+        state0 = None
+        state1 = None
+        if all_map['0']:
+            state0 = all_map['0'].pop()
+        if all_map['1']:
+            state1 = all_map['1'].pop()
+
+        for candidate in state_map.values():
+            if candidate['0'] and candidate['1']:
+                state0 = candidate['0'].pop()
+                state1 = candidate['1'].pop()
+
+        if state0 and state1:
+            assert '1' not in state0.old_tape
+            assert '0' not in state1.old_tape
+            state0.next1 = state1.next1
+            state0.write1 = state1.write1
+            state0.move1 = state1.move1
+            state0.old_tape = state0.old_tape | state1.old_tape
+            state1.next0 = state0.next0
+            state1.write0 = state0.write0
+            state1.move0 = state0.move0
+            state1.old_tape = state1.old_tape | state0.old_tape
+            return True
+        else:
+            return False
+
+
+    def skip_noop_transitions(self):
+        """Skip past state transitions that only return the tape head without updates or branching."""
+        did_work = False
+
+        for state in self.reachable():
+            tup = (state.next0, state.next1, state.write0, state.write1,
+                   state.move0, state.move1)
+
+            if not isinstance(state.next0, Halt) and state.next0.set \
+                and not isinstance(state.next0.next0, Halt) and state.next0.next0.set:
+                if state.next0.next0 is state.next0.next1 and \
+                    state.next0.write0 == '0' and state.next0.write1 == '1' and \
+                    state.next0.move0 == -state.move0 and \
+                    state.next0.move1 == -state.move0:
+
+                    if state.write0 == '0':
+                        state.write0 = state.next0.next0.write0
+                        state.move0 = state.next0.next0.move0
+                        state.next0 = state.next0.next0.next0
+                    else:
+                        state.write0 = state.next0.next0.write1
+                        state.move0 = state.next0.next0.move1
+                        state.next0 = state.next0.next0.next1
+
+            if not isinstance(state.next1, Halt) and state.next1.set \
+                and not isinstance(state.next1.next0, Halt) and state.next1.next0.set:
+                if state.next1.next0 is state.next1.next1 and \
+                    state.next1.write0 == '0' and state.next1.write1 == '1' and \
+                    state.next1.move0 == -state.move1 and \
+                    state.next1.move1 == -state.move1:
+
+                        if state.write1 == '0':
+                            state.write1 = state.next1.next0.write0
+                            state.move1 = state.next1.next0.move0
+                            state.next1 = state.next1.next0.next0
+                        else:
+                            state.write1 = state.next1.next0.write1
+                            state.move1 = state.next1.next0.move1
+                            state.next1 = state.next1.next0.next1
+
+            # It's possible that the optimization might leave state unchanged.
+            # (Though this would imply the TM would spin between two states making no progress at this point)
+            # Check if there was actually a change.
+            if tup != (state.next0, state.next1, state.write0, state.write1,
+                       state.move0, state.move1):
+                did_work = True
+
+        return did_work
 
     def print_subs(self):
         """Dump the subroutines used by this machine."""
